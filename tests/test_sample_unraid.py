@@ -153,3 +153,16 @@ def test_unmounted_slots_are_not_listed_as_storage():
 def test_boot_device_is_sorted_after_the_pools():
     order = [d["name"] for d in server.disk_inventory()["devices"]]
     assert order[0] == "parity" and order[-1] == "flash"
+
+
+def test_slot_state_marks_only_the_empty_slots():
+    states = {name: d["slot_state"] for name, d in devices().items()}
+    assert states["disk5"] == "unassigned" and states["parity2"] == "unassigned"
+    assert all(v == "ok" for k, v in states.items() if k not in ("disk5", "parity2"))
+
+
+def test_dashboard_lists_parity_in_smart_table_and_hides_empty_slots():
+    html = server.DASHBOARD_HTML
+    assert '["Parity","Data","Cache"].includes(x.role)' in html
+    assert 'x.slot_state!=="unassigned"' in html
+    assert 'x.slot_state==="unassigned"?"Empty slot ("' in html

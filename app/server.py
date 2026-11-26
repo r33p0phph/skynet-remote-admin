@@ -721,6 +721,9 @@ def disk_inventory() -> dict[str, Any]:
             "serial": mask_serial(fields.get("id") or fields.get("idSb")),
             "size_bytes": kib_to_bytes(fields.get("size")),
             "status": fields.get("status") or "Unknown",
+            "slot_state": classify_disk_status(
+                fields.get("status") or "Unknown", bool(device), kib_to_bytes(fields.get("size"))
+            ),
             "spun_down": spun_down,
             "temperature_c": int_or_none(fields.get("temp")) if fields.get("temp") not in ("", "*", None) else None,
             "read_errors": int_or_none(fields.get("numErrors")),
@@ -948,6 +951,7 @@ table{width:100%;border-collapse:collapse;table-layout:fixed}td,th{text-align:le
 const $=id=>document.getElementById(id);
 async function api(p){const r=await fetch(p,{cache:"no-store"}),b=await r.text();if(!r.ok)throw Error("HTTP "+r.status+": "+b);return JSON.parse(b)}
 function show(v){$("output").textContent=typeof v==="string"?v:JSON.stringify(v,null,2)}
+function ts(v){const d=new Date(v);return isNaN(d)?v:d.toLocaleString()}
 function fmt(b){if(b==null)return"Unavailable";let u=["B","KiB","MiB","GiB","TiB"],i=0;while(b>=1024&&i<u.length-1){b/=1024;i++}return b.toFixed(i?1:0)+" "+u[i]}
 const TONES=[
  [/^(Healthy|Recent|DISK_OK|OK|No flagged attributes|running|healthy)$/,"good"],
@@ -981,8 +985,8 @@ async function loadArray(quiet){try{
  let text="Array: "+a.state+" (Unraid state: "+a.array_state+"). Configured data disks: "+a.configured_data_disks+".";
  if(p&&p.running)text+=" Parity operation: "+(p.action||"running")+(p.percent!=null?" "+p.percent+"%":"")+".";
  summary("arraySummary",text,a.issues,tone(a.state));
- table("inventory",["Slot","Role","Device","Serial","Unraid status","Temp \u00b0C","Errors","SMART assessment","SMART checked"],d.inventory.devices.map(x=>[x.name,x.role,x.device,x.serial,x.status,x.temperature_c,x.read_errors,x.smart?(x.smart.assessment+(x.smart.stale?" (stale)":"")):"No report",x.smart?(x.smart.checked_at+(x.spun_down?" (disk spun down)":"")):"Unavailable"]));
- table("smartDetails",["Disk","Assessment","Reallocated","Pending","Offline uncorrectable","Reported uncorrectable","CRC errors","Power-on hours"],d.inventory.devices.filter(x=>x.role==="Data"||x.role==="Cache").map(x=>{const s=x.smart||{},a=s.attributes||{};return [x.name,s.assessment||"No report",a.reallocated_sectors??"Unavailable",a.pending_sectors??"Unavailable",a.offline_uncorrectable??"Unavailable",a.reported_uncorrectable??"Unavailable",a.crc_errors??"Unavailable",a.power_on_hours??"Unavailable"]}));
+ table("inventory",["Slot","Role","Device","Serial","Unraid status","Temp \u00b0C","Errors","SMART assessment","SMART checked"],d.inventory.devices.map(x=>[x.name,x.role,x.device,x.serial,x.slot_state==="unassigned"?"Empty slot ("+x.status+")":x.status,x.temperature_c,x.read_errors,x.smart?(x.smart.assessment+(x.smart.stale?" (stale)":"")):"No report",x.smart?(ts(x.smart.checked_at)+(x.spun_down?" (disk spun down)":"")):"Unavailable"]));
+ table("smartDetails",["Disk","Assessment","Reallocated","Pending","Offline uncorrectable","Reported uncorrectable","CRC errors","Power-on hours"],d.inventory.devices.filter(x=>["Parity","Data","Cache"].includes(x.role)&&x.slot_state!=="unassigned").map(x=>{const s=x.smart||{},a=s.attributes||{};return [x.name,s.assessment||"No report",a.reallocated_sectors??"Unavailable",a.pending_sectors??"Unavailable",a.offline_uncorrectable??"Unavailable",a.reported_uncorrectable??"Unavailable",a.crc_errors??"Unavailable",a.power_on_hours??"Unavailable"]}));
  table("storage",["Volume","Role","Mount","Used","Available","Capacity","Used %"],d.storage.map(x=>[x.name,x.role,x.mount,x.used_bytes==null?"Unavailable":fmt(x.used_bytes),x.available_bytes==null?"Unavailable":fmt(x.available_bytes),x.total_bytes==null?"Unavailable":fmt(x.total_bytes),x.used_percent==null?"Unavailable":x.used_percent+"%"]));
  if(!quiet)show(d)}catch(x){$("arraySummary").textContent=x.message}}
 async function loadBackups(){try{
