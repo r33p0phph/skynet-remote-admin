@@ -1,0 +1,32 @@
+smartctl 7.5 2025-04-30 r5714 [x86_64-linux-6.18.64-Unraid] (local build)
+Copyright (C) 2002-25, Bruce Allen, Christian Franke, www.smartmontools.org
+
+=== START OF READ SMART DATA SECTION ===
+SMART Attributes Data Structure revision number: 10
+Vendor Specific SMART Attributes with Thresholds:
+ID# ATTRIBUTE_NAME          FLAG     VALUE WORST THRESH TYPE      UPDATED  WHEN_FAILED RAW_VALUE
+  1 Raw_Read_Error_Rate     0x000f   083   064   044    Pre-fail  Always       -       219281926
+  3 Spin_Up_Time            0x0003   093   092   000    Pre-fail  Always       -       0
+  4 Start_Stop_Count        0x0032   100   100   020    Old_age   Always       -       667
+  5 Reallocated_Sector_Ct   0x0033   099   099   010    Pre-fail  Always       -       7344
+  7 Seek_Error_Rate         0x000f   095   060   045    Pre-fail  Always       -       3461180999
+  9 Power_On_Hours          0x0032   022   022   000    Old_age   Always       -       68539 (182 122 0)
+ 10 Spin_Retry_Count        0x0013   100   100   097    Pre-fail  Always       -       0
+ 12 Power_Cycle_Count       0x0032   100   100   020    Old_age   Always       -       660
+184 End-to-End_Error        0x0032   100   100   099    Old_age   Always       -       0
+187 Reported_Uncorrect      0x0032   087   087   000    Old_age   Always       -       13
+188 Command_Timeout         0x0032   100   100   000    Old_age   Always       -       0 0 0
+189 High_Fly_Writes         0x003a   030   030   000    Old_age   Always       -       70
+190 Airflow_Temperature_Cel 0x0022   072   047   040    Old_age   Always       -       28 (Min/Max 27/32)
+191 G-Sense_Error_Rate      0x0032   095   095   000    Old_age   Always       -       10064
+192 Power-Off_Retract_Count 0x0032   099   099   000    Old_age   Always       -       2055
+193 Load_Cycle_Count        0x0032   099   099   000    Old_age   Always       -       3494
+194 Temperature_Celsius     0x0022   028   053   000    Old_age   Always       -       28 (0 19 0 0 0)
+195 Hardware_ECC_Recovered  0x001a   008   001   000    Old_age   Always       -       219281926
+197 Current_Pending_Sector  0x0012   100   100   000    Old_age   Always       -       0
+198 Offline_Uncorrectable   0x0010   100   100   000    Old_age   Offline      -       0
+199 UDMA_CRC_Error_Count    0x003e   200   200   000    Old_age   Always       -       0
+240 Head_Flying_Hours       0x0000   100   253   000    Old_age   Offline      -       67912h+51m+30.869s
+241 Total_LBAs_Written      0x0000   100   253   000    Old_age   Offline      -       312741309044
+242 Total_LBAs_Read         0x0000   100   253   000    Old_age   Offline      -       672224716606
+

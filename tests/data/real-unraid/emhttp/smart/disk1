@@ -29,3 +29,4 @@ ID# ATTRIBUTE_NAME          FLAG     VALUE WORST THRESH TYPE      UPDATED  WHEN_
 240 Head_Flying_Hours       0x0000   100   253   000    Old_age   Offline      -       52433h+19m+10.832s
 241 Total_LBAs_Written      0x0000   100   253   000    Old_age   Offline      -       321527501018
 242 Total_LBAs_Read         0x0000   100   253   000    Old_age   Offline      -       430278569194
+
