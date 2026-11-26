@@ -1,16 +1,20 @@
-"""Skynet Remote Admin: read-only diagnostics for an Unraid host.
+"""Skynet Remote Admin: read-only diagnostics and scoped configuration backups for Unraid.
 
 Runs in a container with read-only bind mounts of the host's /proc, /sys, /mnt and
 /var/local/emhttp (optionally /boot and /var/log) and reaches Docker only through a
-restricted docker-socket-proxy.
+restricted docker-socket-proxy. The one writable mount is the backup destination folder
+(CENTRAL_BACKUP_DIR), used only by the allowlisted backup manager.
 """
 import functools
+import json
 import logging
 import os
 import re
 import secrets
+import shutil
 import threading
 import time
+import uuid
 import zipfile
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
@@ -20,7 +24,7 @@ from typing import Any
 import docker
 import requests
 from docker.errors import DockerException
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Body, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
@@ -86,9 +90,11 @@ OPTIONAL_VOLUMES = [
 # Point these at /host/mnt/cache/... if the shares live on a cache pool: it avoids the
 # /mnt/user FUSE layer, which can wake array disks.
 APPDATA_ROOT = Path(os.environ.get("APPDATA_ROOT", "/host/mnt/user/appdata"))
-CENTRAL_BACKUP_DIR = Path(
-    os.environ.get("CENTRAL_BACKUP_DIR", "/host/mnt/user/backups/skynet")
-)
+# Where the backup manager writes its ZIP archives. This is the only writable mount, e.g.
+#   -v /mnt/datastorage/backups/skynet:/host/backups
+CENTRAL_BACKUP_DIR = Path(os.environ.get("CENTRAL_BACKUP_DIR", "/host/backups"))
+# How that folder is shown in the UI (the path on the Unraid host).
+BACKUP_DESTINATION_LABEL = os.environ.get("BACKUP_DESTINATION_LABEL", "/mnt/datastorage/backups/skynet")
 
 # (name, folder, stale_after_days, optional)
 BACKUP_SOURCES = [
@@ -371,7 +377,7 @@ def backup_inventory() -> dict[str, Any]:
 
     return {
         "sources": results,
-        "central_destination": public_path(CENTRAL_BACKUP_DIR),
+        "central_destination": BACKUP_DESTINATION_LABEL,
         "central_destination_exists": CENTRAL_BACKUP_DIR.is_dir(),
         "mode": "read-only inventory",
         "integrity_verified": False,
@@ -380,6 +386,405 @@ def backup_inventory() -> dict[str, Any]:
             "Presence, size and timestamps do not prove a restore will succeed."
         ),
     }
+
+
+# ---------------------------------------------------------------------------
+# backup manager
+# ---------------------------------------------------------------------------
+# Creates CRC-verified ZIP snapshots of a fixed allowlist of configuration folders. Only the
+# item IDs below can be selected; the browser never supplies a path. Applications are not
+# stopped, so these are live snapshots and database consistency is not guaranteed. The only
+# writable mount the app needs is the destination folder (CENTRAL_BACKUP_DIR).
+
+MAX_KEPT_JOBS = 20
+BACKUP_EXCLUDED_NAMES = {".env", ".envx"}
+BACKUP_ITEMS: dict[str, dict[str, Any]] = {
+    "npm": {
+        "name": "Nginx Proxy Manager",
+        "optional": False,
+        "sources": [(APPDATA_ROOT / "Nginx-Proxy-Manager-Official", "Nginx-Proxy-Manager-Official")],
+        "exclude_env": False,
+    },
+    "radarr": {
+        "name": "Radarr",
+        "optional": False,
+        "sources": [(APPDATA_ROOT / "binhex-radarr", "binhex-radarr")],
+        "exclude_env": False,
+    },
+    "sonarr": {
+        "name": "Sonarr",
+        "optional": False,
+        "sources": [(APPDATA_ROOT / "binhex-sonarr", "binhex-sonarr")],
+        "exclude_env": False,
+    },
+    "prowlarr": {
+        "name": "Prowlarr",
+        "optional": False,
+        "sources": [(APPDATA_ROOT / "binhex-prowlarr", "binhex-prowlarr")],
+        "exclude_env": False,
+    },
+    "qbittorrent": {
+        "name": "qBittorrent",
+        "optional": False,
+        "sources": [
+            (APPDATA_ROOT / "binhex-qbittorrent", "binhex-qbittorrent"),
+            (APPDATA_ROOT / "qbittorrent", "qbittorrent"),
+        ],
+        "exclude_env": False,
+    },
+    "seerr": {
+        "name": "Seerr",
+        "optional": False,
+        "sources": [(APPDATA_ROOT / "seerr", "seerr")],
+        "exclude_env": False,
+    },
+    "skynet_mcp": {
+        "name": "Skynet MCP Configuration",
+        "optional": False,
+        "sources": [(APPDATA_ROOT / "skynet-mcp", "skynet-mcp")],
+        "exclude_env": True,
+    },
+    # Needs the read-only /boot:/host/boot mount. Unchecked by default in the UI because the
+    # flash config holds secrets (licence key, share and user settings).
+    "boot": {
+        "name": "Unraid Boot Configuration",
+        "optional": True,
+        "sources": [(Path("/host/boot/config"), "boot/config")],
+        "exclude_env": False,
+    },
+}
+
+backup_state_lock = threading.Lock()
+backup_jobs: dict[str, dict[str, Any]] = {}
+
+
+def now_iso() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def backup_options() -> list[dict[str, Any]]:
+    options = []
+    for item_id, item in BACKUP_ITEMS.items():
+        existing = [str(path) for path, _ in item["sources"] if path.is_dir()]
+        options.append({
+            "id": item_id,
+            "name": item["name"],
+            "optional": item["optional"],
+            "available": bool(existing),
+            "source_count": len(existing),
+        })
+    return options
+
+
+def backup_file_list(
+    item: dict[str, Any],
+) -> tuple[list[tuple[Path, str]], list[str], list[dict[str, str]]]:
+    """Return (files to archive, missing source roots, entries that had to be skipped)."""
+    files: list[tuple[Path, str]] = []
+    missing: list[str] = []
+    excluded: list[dict[str, str]] = []
+
+    def record(path: Path, reason: str, kind: str = "file") -> None:
+        excluded.append({"item": item["name"], "path": public_path(path), "reason": reason, "kind": kind})
+
+    for root, archive_root in item["sources"]:
+        if root.is_symlink():
+            missing.append(public_path(root) + " (symlink skipped)")
+            continue
+        if not root.is_dir():
+            missing.append(public_path(root))
+            continue
+        if not os.access(root, os.R_OK | os.X_OK):
+            record(root, "Directory is not readable or searchable by the dashboard process", "directory")
+            continue
+
+        def walk_error(exc: OSError, root=root) -> None:
+            record(Path(exc.filename or root), exc.strerror or str(exc), "directory")
+
+        for current, dirs, names in os.walk(root, topdown=True, followlinks=False, onerror=walk_error):
+            current_path = Path(current)
+            kept_dirs = []
+            for dirname in sorted(dirs):
+                directory = current_path / dirname
+                if directory.is_symlink():
+                    continue
+                if not os.access(directory, os.R_OK | os.X_OK):
+                    record(directory, "Directory is not readable or searchable by the dashboard process", "directory")
+                    continue
+                kept_dirs.append(dirname)
+            dirs[:] = kept_dirs
+
+            for name in sorted(names):
+                path = current_path / name
+                try:
+                    if path.is_symlink() or not path.is_file():
+                        continue
+                    if item.get("exclude_env") and (name in BACKUP_EXCLUDED_NAMES or name.startswith(".env.")):
+                        continue
+                    if not os.access(path, os.R_OK):
+                        record(path, "File is not readable by the dashboard process")
+                        continue
+                    arcname = str(Path(archive_root) / path.relative_to(root)).replace("\\", "/")
+                    files.append((path, arcname))
+                except (OSError, ValueError) as exc:
+                    record(path, str(exc))
+    return files, missing, excluded
+
+
+def set_backup_job(job_id: str, **updates: Any) -> None:
+    with backup_state_lock:
+        if job_id in backup_jobs:
+            backup_jobs[job_id].update(updates)
+            backup_jobs[job_id]["updated_at"] = now_iso()
+
+
+def run_backup_job(job_id: str, selected_ids: list[str]) -> None:
+    partial_path: Path | None = None
+    excluded_files: list[dict[str, str]] = []
+    try:
+        if not CENTRAL_BACKUP_DIR.is_dir():
+            raise RuntimeError("Backup destination is not mounted or does not exist.")
+        if not os.access(CENTRAL_BACKUP_DIR, os.W_OK):
+            raise RuntimeError("Dashboard process cannot write to the backup destination.")
+
+        timestamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
+        final_name = f"Skynet-backup-{timestamp}-{job_id[:8]}.zip"
+        partial_path = CENTRAL_BACKUP_DIR / (final_name + ".partial")
+        final_path = CENTRAL_BACKUP_DIR / final_name
+
+        source_records = []
+        all_files: list[tuple[str, Path, str]] = []
+        missing_sources: list[str] = []
+        for item_id in selected_ids:
+            item = BACKUP_ITEMS[item_id]
+            files, missing, excluded = backup_file_list(item)
+            if not files and not excluded:
+                raise RuntimeError(f"No files found for {item['name']}. Check that its source path is mounted.")
+            excluded_files.extend(excluded)
+            source_records.append({
+                "id": item_id,
+                "name": item["name"],
+                "files": len(files),
+                "discovered_files": len(files) + sum(1 for entry in excluded if entry["kind"] == "file"),
+                "source_paths": [public_path(root) for root, _ in item["sources"] if root.is_dir()],
+            })
+            missing_sources.extend(missing)
+            all_files.extend((item_id, path, arcname) for path, arcname in files)
+
+        total_files = len(all_files)
+        total_bytes = 0
+        for _, path, _ in all_files:
+            try:
+                total_bytes += path.stat().st_size
+            except OSError:
+                pass
+
+        free_bytes = shutil.disk_usage(CENTRAL_BACKUP_DIR).free
+        if free_bytes < total_bytes:
+            raise RuntimeError(
+                f"Not enough free space at the destination: {total_bytes} bytes of source files, "
+                f"{free_bytes} bytes free."
+            )
+
+        set_backup_job(
+            job_id,
+            status="Running",
+            phase="Creating archive",
+            total_files=total_files,
+            files_done=0,
+            total_bytes=total_bytes,
+            bytes_done=0,
+            archive=final_name,
+            selected=[BACKUP_ITEMS[x]["name"] for x in selected_ids],
+        )
+
+        manifest = {
+            "created_at": now_iso(),
+            "host": "Skynet",
+            "backup_type": "live configuration snapshot",
+            "applications_paused": False,
+            "database_consistency": "Not guaranteed. Running applications were not stopped.",
+            "items": source_records,
+            "missing_optional_sources": missing_sources,
+            "excluded_files": excluded_files,
+            "excluded": [
+                "Media and downloads",
+                "Immich database and photo libraries",
+                "Plex",
+                "Krusader",
+                "Skynet MCP .env and .envx files",
+                "Symlinks",
+            ],
+        }
+
+        files_done = 0
+        bytes_done = 0
+        included_by_item = {item_id: 0 for item_id in selected_ids}
+        with zipfile.ZipFile(partial_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=3, allowZip64=True) as archive:
+            for item_id, path, arcname in all_files:
+                info = None
+                try:
+                    info = path.stat()
+                    source = path.open("rb")
+                except OSError as exc:
+                    excluded_files.append({
+                        "item": BACKUP_ITEMS[item_id]["name"],
+                        "path": public_path(path),
+                        "reason": str(exc),
+                        "kind": "file",
+                    })
+                    total_files = max(0, total_files - 1)
+                    if info is not None:
+                        total_bytes = max(0, total_bytes - info.st_size)
+                    set_backup_job(
+                        job_id,
+                        phase="Skipping unreadable source file",
+                        total_files=total_files,
+                        total_bytes=total_bytes,
+                        excluded_files=list(excluded_files),
+                        excluded_count=len(excluded_files),
+                    )
+                    continue
+
+                try:
+                    with source:
+                        # strict_timestamps=False clamps pre-1980 dates, which ZIP cannot store.
+                        zip_info = zipfile.ZipInfo.from_file(path, arcname, strict_timestamps=False)
+                        zip_info.compress_type = zipfile.ZIP_DEFLATED
+                        with archive.open(zip_info, "w") as target:
+                            shutil.copyfileobj(source, target, length=1024 * 1024)
+                    bytes_done += info.st_size
+                    files_done += 1
+                    included_by_item[item_id] += 1
+                    if files_done % 10 == 0 or files_done == total_files:
+                        set_backup_job(job_id, phase="Writing files", files_done=files_done, bytes_done=bytes_done)
+                except OSError as exc:
+                    raise RuntimeError(
+                        f"Read or archive error for {BACKUP_ITEMS[item_id]['name']}: {public_path(path)}"
+                    ) from exc
+
+            for record in source_records:
+                record["files"] = included_by_item[record["id"]]
+            manifest["excluded_files"] = excluded_files
+            manifest["source_complete"] = not excluded_files and not missing_sources
+            manifest["excluded_file_count"] = len(excluded_files)
+            archive.writestr("BACKUP-MANIFEST.json", json.dumps(manifest, indent=2, sort_keys=True))
+
+        os.chmod(partial_path, 0o600)
+        set_backup_job(job_id, phase="Verifying archive", files_done=files_done, bytes_done=bytes_done)
+        with zipfile.ZipFile(partial_path, "r") as archive:
+            bad_member = archive.testzip()
+            if bad_member is not None:
+                raise RuntimeError(f"Archive verification failed at member: {bad_member}")
+
+        os.replace(partial_path, final_path)
+        partial_path = None
+        complete = not excluded_files and not missing_sources
+        set_backup_job(
+            job_id,
+            status="Completed",
+            files_done=files_done,
+            bytes_done=bytes_done,
+            archive=final_name,
+            archive_bytes=final_path.stat().st_size,
+            integrity_verified=True,
+            source_complete=complete,
+            completeness_status="Complete" if complete else "Incomplete",
+            excluded_count=len(excluded_files),
+            excluded_files=list(excluded_files),
+            missing_sources=missing_sources,
+            phase="CRC passed, source complete" if complete else "CRC passed, source incomplete",
+            destination=f"{BACKUP_DESTINATION_LABEL}/{final_name}",
+            completed_at=now_iso(),
+        )
+    except Exception as exc:  # the job must always end in a visible state
+        log.warning("backup job %s failed: %s", job_id[:8], exc)
+        if partial_path is not None:
+            try:
+                partial_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        set_backup_job(
+            job_id,
+            status="Failed",
+            phase="Stopped",
+            error=str(exc),
+            integrity_verified=False,
+            source_complete=False,
+            completeness_status="Failed",
+            excluded_count=len(excluded_files),
+            excluded_files=list(excluded_files),
+        )
+    finally:
+        backup_inventory.cache_clear()
+
+
+def backup_job_snapshot() -> dict[str, Any]:
+    with backup_state_lock:
+        jobs = [dict(value) for value in backup_jobs.values()]
+    archives = []
+    if CENTRAL_BACKUP_DIR.is_dir():
+        try:
+            newest_first = sorted(
+                CENTRAL_BACKUP_DIR.glob("Skynet-backup-*.zip"), key=lambda p: p.stat().st_mtime, reverse=True
+            )[:20]
+        except OSError:
+            newest_first = []
+        for path in newest_first:
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            archives.append({
+                "name": path.name,
+                "size_bytes": stat.st_size,
+                "modified": datetime.fromtimestamp(stat.st_mtime).astimezone().isoformat(timespec="seconds"),
+            })
+    return {
+        "jobs": sorted(jobs, key=lambda x: x.get("created_at", ""), reverse=True),
+        "archives": archives,
+        "active": any(job.get("status") in ("Queued", "Running") for job in jobs),
+    }
+
+
+def launch_backup_worker(job_id: str, items: list[str]) -> None:
+    threading.Thread(target=run_backup_job, args=(job_id, items), daemon=True).start()
+
+
+def start_backup_job(items: list[str]) -> dict[str, Any]:
+    with backup_state_lock:
+        if any(job.get("status") in ("Queued", "Running") for job in backup_jobs.values()):
+            raise HTTPException(409, "A backup job is already running.")
+        job_id = uuid.uuid4().hex
+        now = now_iso()
+        selected = [BACKUP_ITEMS[item]["name"] for item in items]
+        backup_jobs[job_id] = {
+            "job_id": job_id,
+            "status": "Queued",
+            "phase": "Waiting to start",
+            "created_at": now,
+            "updated_at": now,
+            "selected": selected,
+            "files_done": 0,
+            "total_files": 0,
+            "bytes_done": 0,
+            "total_bytes": 0,
+            "integrity_verified": False,
+            "source_complete": False,
+            "completeness_status": "Pending",
+            "excluded_count": 0,
+            "excluded_files": [],
+            "missing_sources": [],
+        }
+        # Keep the in-memory history bounded: drop the oldest finished jobs.
+        finished = sorted(
+            (j for j in backup_jobs.values() if j["status"] not in ("Queued", "Running")),
+            key=lambda j: j["created_at"],
+        )
+        for old in finished[: max(0, len(backup_jobs) - MAX_KEPT_JOBS)]:
+            del backup_jobs[old["job_id"]]
+    launch_backup_worker(job_id, items)
+    return {"job_id": job_id, "status": "Queued", "selected": selected}
 
 
 # ---------------------------------------------------------------------------
@@ -939,14 +1344,24 @@ table{width:100%;border-collapse:collapse;table-layout:fixed}td,th{text-align:le
 .small{color:#aebbc8;font-size:.9rem}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:.7rem}
 .metric{background:#10171d;border:1px solid #34404b;border-radius:.5rem;padding:.8rem}.metric strong{display:block;font-size:1.15rem;margin-top:.25rem}
 .good{color:#8ee0a1}.warn{color:#ffd27a}.bad{color:#ff9292}
+.opt{display:block;margin:.45rem 0}
 </style></head><body>
-<h1>Skynet Remote Admin</h1><p class="small">Read-only diagnostics. No container or array changes can be made here.</p>
+<h1>Skynet Remote Admin</h1><p class="small">Diagnostics and scoped configuration backups. No container or array changes can be made here.</p>
 <div class="panel"><h2>Host health</h2><button data-action="loadHealth">Refresh host health</button> <label class="small"><input type="checkbox" id="autoRefresh" checked> Auto-refresh health and array every 60 s</label><div id="healthCards" class="cards">Loading...</div><div id="sensorTable"></div></div>
-<div class="panel"><h2>Backup health</h2><button data-action="loadBackups">Refresh backup inventory</button><div id="backupSummary"></div><div id="backupTable"></div></div>
 <div class="panel"><h2>Array and storage</h2><button data-action="loadArray">Refresh array and storage</button><div id="arraySummary"></div><div id="inventory"></div><h3>SMART attributes</h3><div id="smartDetails"></div><h3>Mounted storage</h3><div id="storage"></div></div>
 <div class="panel"><h2>Docker</h2><button data-action="loadStatus">Refresh Docker status</button><button data-action="loadContainers">List containers</button><div id="status">Choose an action.</div><div id="containerTable"></div></div>
 <div class="panel"><h2>Container logs</h2><label for="container">Exact container name</label> <input id="container" placeholder="e.g. binhex-qbittorrent" autocomplete="off"> <label for="tail">Log lines</label> <select id="tail"><option>50</option><option selected>100</option><option>200</option><option>300</option></select><button data-action="loadLogs">Read logs</button><div id="logStatus" class="small"></div></div>
 <div class="panel"><h2>Details</h2><pre id="output">Results appear here.</pre></div>
+<div class="panel"><h2>Backup manager</h2>
+<p class="small">Select configuration items to archive. Running applications are not stopped. These are live snapshots, so database consistency is not guaranteed. Archives are CRC-verified before they are finalized. Archives can contain secrets such as keys, certificates and password hashes, so keep the destination folder private.</p>
+<div id="backupOptions">Loading backup options...</div>
+<button data-action="startBackup">Start selected backup</button><button data-action="loadBackups">Refresh backup status</button>
+<div id="backupRunStatus" class="small"></div>
+<h3>Backup health</h3>
+<div id="backupSummary"></div><div id="backupTable"></div>
+<h3>Recent backup jobs</h3><div id="backupJobs"></div>
+<h3>Excluded source files</h3><div id="backupExclusions"></div>
+<h3>Archives in destination</h3><div id="backupArchives"></div></div>
 <script nonce="__NONCE__">
 const $=id=>document.getElementById(id);
 async function api(p){const r=await fetch(p,{cache:"no-store"}),b=await r.text();if(!r.ok)throw Error("HTTP "+r.status+": "+b);return JSON.parse(b)}
@@ -954,9 +1369,9 @@ function show(v){$("output").textContent=typeof v==="string"?v:JSON.stringify(v,
 function ts(v){const d=new Date(v);return isNaN(d)?v:d.toLocaleString()}
 function fmt(b){if(b==null)return"Unavailable";let u=["B","KiB","MiB","GiB","TiB"],i=0;while(b>=1024&&i<u.length-1){b/=1024;i++}return b.toFixed(i?1:0)+" "+u[i]}
 const TONES=[
- [/^(Healthy|Recent|DISK_OK|OK|No flagged attributes|running|healthy)$/,"good"],
- [/^(Degraded|Stale|Missing folder|No backup files|Attention required|FAILED|DISK_DSBL|DISK_INVALID|DISK_NP_DSBL|unhealthy|dead)/,"bad"],
- [/^(Check|Review attributes|Attention|Not present \(optional\)|DISK_NEW|exited|restarting|paused|created|Stopped|Unknown|No parsed attributes)/,"warn"]
+ [/^(Healthy|Recent|DISK_OK|OK|No flagged attributes|running|healthy|Completed|Complete|Passed)$/,"good"],
+ [/^(Degraded|Stale|Missing folder|No backup files|Attention required|FAILED|Failed|Incomplete|DISK_DSBL|DISK_INVALID|DISK_NP_DSBL|unhealthy|dead)/,"bad"],
+ [/^(Check|Review attributes|Attention|Running|Queued|Not present \(optional\)|DISK_NEW|exited|restarting|paused|created|Stopped|Unknown|No parsed attributes)/,"warn"]
 ];
 function tone(t){for(const [re,c] of TONES)if(re.test(t))return c;return""}
 function table(target,headers,rows){const root=$(target);root.textContent="";if(!rows.length){root.textContent="No data available.";return}
@@ -989,13 +1404,31 @@ async function loadArray(quiet){try{
  table("smartDetails",["Disk","Assessment","Reallocated","Pending","Offline uncorrectable","Reported uncorrectable","CRC errors","Power-on hours"],d.inventory.devices.filter(x=>["Parity","Data","Cache"].includes(x.role)&&x.slot_state!=="unassigned").map(x=>{const s=x.smart||{},a=s.attributes||{};return [x.name,s.assessment||"No report",a.reallocated_sectors??"Unavailable",a.pending_sectors??"Unavailable",a.offline_uncorrectable??"Unavailable",a.reported_uncorrectable??"Unavailable",a.crc_errors??"Unavailable",a.power_on_hours??"Unavailable"]}));
  table("storage",["Volume","Role","Mount","Used","Available","Capacity","Used %"],d.storage.map(x=>[x.name,x.role,x.mount,x.used_bytes==null?"Unavailable":fmt(x.used_bytes),x.available_bytes==null?"Unavailable":fmt(x.available_bytes),x.total_bytes==null?"Unavailable":fmt(x.total_bytes),x.used_percent==null?"Unavailable":x.used_percent+"%"]));
  if(!quiet)show(d)}catch(x){$("arraySummary").textContent=x.message}}
-async function loadBackups(){try{
- const d=await api("/api/backups");
+async function loadBackupOptions(){try{
+ const d=await api("/api/backups/options"),root=$("backupOptions");root.textContent="";
+ for(const item of d.items){const label=document.createElement("label");label.className="opt";
+  const input=document.createElement("input");input.type="checkbox";input.value=item.id;input.disabled=!item.available;input.checked=item.available&&!item.optional;
+  label.append(input,document.createTextNode(" "+item.name+(item.optional?" (optional)":"")+(item.available?"":" (source unavailable)")));root.append(label)}
+ }catch(e){$("backupOptions").textContent=e.message}}
+async function startBackup(){
+ const selected=[...document.querySelectorAll("#backupOptions input:checked")].map(x=>x.value),status=$("backupRunStatus");
+ if(!selected.length){status.textContent="Select at least one available item.";return}
+ status.textContent="Submitting backup job...";
+ try{const r=await fetch("/api/backups/run",{method:"POST",headers:{"Content-Type":"application/json","X-Requested-With":"skynet-admin"},body:JSON.stringify({items:selected}),cache:"no-store"});
+  const b=await r.text();if(!r.ok)throw Error("HTTP "+r.status+": "+b);
+  status.textContent="Backup job started.";pollBackups()}catch(e){status.textContent=e.message}}
+function pollBackups(){loadBackups(true).then(active=>{if(active)setTimeout(pollBackups,3000);else if($("backupRunStatus").textContent==="Backup job started.")$("backupRunStatus").textContent="Backup job finished. See Recent backup jobs."})}
+async function loadBackups(quiet){try{
+ const [d,j]=await Promise.all([api("/api/backups"),api("/api/backups/jobs")]);
  const count=d.sources.reduce((n,x)=>n+x.file_count,0),total=d.sources.reduce((n,x)=>n+x.total_bytes,0);
  const zipTested=d.sources.filter(x=>x.latest_zip_ok!=null).length,zipOk=d.sources.filter(x=>x.latest_zip_ok===true).length;
- summary("backupSummary","Known backup files: "+count+". Total size: "+fmt(total)+". Central destination: "+(d.central_destination_exists?"Present":"Not created")+". Latest ZIP archives passing CRC test: "+zipOk+" of "+zipTested+". A passing test does not prove a restore works.");
+ summary("backupSummary","Known app-native backup files: "+count+". Total size: "+fmt(total)+". Central destination ("+d.central_destination+"): "+(d.central_destination_exists?"Present":"Unavailable")+". Latest ZIP archives passing CRC test: "+zipOk+" of "+zipTested+". A passing test does not prove a restore works.");
  table("backupTable",["Application","Status","Files","Total size","Latest backup","Age days","Latest size","ZIP CRC","Warnings"],d.sources.map(x=>[x.application,x.status,x.file_count,fmt(x.total_bytes),x.latest_timestamp||"None",x.age_days??"Unavailable",x.latest_size_bytes==null?"Unavailable":fmt(x.latest_size_bytes),x.latest_zip_ok===true?"OK":x.latest_zip_ok===false?"FAILED":"n/a",x.warnings.join("; ")||"None"]));
- show(d)}catch(e){$("backupSummary").textContent=e.message}}
+ table("backupJobs",["Status","Phase","Selected items","Progress","Archive","ZIP CRC","Source complete","Excluded","Error"],j.jobs.map(x=>[x.status,x.phase,(x.selected||[]).join(", "),x.total_files?(x.files_done+"/"+x.total_files):"Preparing",x.archive||"Not created",x.integrity_verified?"Passed":"No",x.source_complete?"Yes":(x.completeness_status||"Pending"),x.excluded_count||0,x.error||""]));
+ table("backupExclusions",["Job","Application","Path","Reason"],j.jobs.flatMap(x=>(x.excluded_files||[]).map(e=>[x.archive||x.job_id,e.item,e.path,e.reason])));
+ table("backupArchives",["Archive","Size","Modified"],j.archives.map(x=>[x.name,fmt(x.size_bytes),ts(x.modified)]));
+ if(!quiet)show({inventory:d,jobs:j.jobs,archives:j.archives});
+ return j.active}catch(e){$("backupSummary").textContent=e.message;return false}}
 async function loadStatus(){try{$("status").textContent="Loading...";show(await api("/api/host"));$("status").textContent="Docker host reachable."}catch(e){$("status").textContent=e.message}}
 async function loadContainers(){try{$("status").textContent="Loading...";
  const d=await api("/api/containers");
@@ -1009,11 +1442,11 @@ async function loadLogs(){const s=$("logStatus");try{
  const d=await api("/api/logs?name="+encodeURIComponent(n)+"&tail="+encodeURIComponent(t));
  s.textContent=d.container+": "+d.line_count+" lines, "+d.redactions+" secret-like values redacted"+(d.truncated?", output truncated":"")+".";
  show(d.logs||"(no output)")}catch(e){s.textContent=e.message}}
-const actions={loadHealth:()=>loadHealth(false),loadArray:()=>loadArray(false),loadBackups,loadStatus,loadContainers,loadLogs};
+const actions={loadHealth:()=>loadHealth(false),loadArray:()=>loadArray(false),loadBackups:()=>loadBackups(false),startBackup,loadStatus,loadContainers,loadLogs};
 document.addEventListener("click",ev=>{const b=ev.target.closest("[data-action]");if(b&&actions[b.dataset.action])actions[b.dataset.action]()});
 $("container").addEventListener("keydown",ev=>{if(ev.key==="Enter")loadLogs()});
 setInterval(()=>{if($("autoRefresh").checked&&!document.hidden){loadHealth(true);loadArray(true)}},60000);
-loadHealth(true);loadArray(true);
+loadHealth(true);loadArray(true);loadBackupOptions();loadBackups(true);
 </script></body></html>"""
 
 
@@ -1086,6 +1519,48 @@ def array_storage(_: str = Depends(require_auth)) -> dict[str, Any]:
 @app.get("/api/backups")
 def backups(_: str = Depends(require_auth)) -> dict[str, Any]:
     return backup_inventory()
+
+
+def require_custom_header(request: Request) -> None:
+    """State-changing calls must carry a header that a page on another site cannot add.
+
+    Browsers attach saved Basic credentials to cross-site requests automatically, so a
+    malicious page could otherwise submit a POST. Setting a custom header needs a CORS
+    preflight, which this app never grants.
+    """
+    if request.headers.get("x-requested-with") != "skynet-admin":
+        raise HTTPException(403, "Missing X-Requested-With header")
+
+
+@app.get("/api/backups/options")
+def backups_options(_: str = Depends(require_auth)) -> dict[str, Any]:
+    return {"items": backup_options(), "destination": BACKUP_DESTINATION_LABEL}
+
+
+@app.get("/api/backups/jobs")
+def backups_jobs(_: str = Depends(require_auth)) -> dict[str, Any]:
+    return backup_job_snapshot()
+
+
+@app.post("/api/backups/run")
+def backups_run(
+    items: list[str] = Body(..., embed=True),
+    _: str = Depends(require_auth),
+    __: None = Depends(require_custom_header),
+) -> dict[str, Any]:
+    if not items:
+        raise HTTPException(400, "Select at least one backup item.")
+    if len(items) > len(BACKUP_ITEMS) or len(set(items)) != len(items):
+        raise HTTPException(400, "Invalid backup selection.")
+    if any(item not in BACKUP_ITEMS for item in items):
+        raise HTTPException(400, "Unknown backup item selection.")
+    unavailable = [
+        BACKUP_ITEMS[item]["name"] for item in items
+        if not any(root.is_dir() for root, _arc in BACKUP_ITEMS[item]["sources"])
+    ]
+    if unavailable:
+        raise HTTPException(400, "Source not available: " + ", ".join(unavailable))
+    return start_backup_job(items)
 
 
 @app.get("/api/containers")
