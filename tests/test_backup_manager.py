@@ -117,7 +117,7 @@ def test_empty_source_is_an_error_not_an_empty_archive(env):
         if path.is_file():
             path.unlink()
     job = run(["seerr"])
-    assert job["status"] == "Failed" and "No files found" in job["error"]
+    assert job["status"] == "Failed" and "No files could be archived" in job["error"]
     assert list(env["dest"].iterdir()) == []
 
 
@@ -216,3 +216,49 @@ def test_dashboard_puts_the_backup_panel_last_and_posts_with_the_header():
     assert titles[-1] == "Backup manager" and "Backup health" not in titles
     assert '"X-Requested-With":"skynet-admin"' in html
     assert 'data-action="startBackup"' in html
+
+
+# ---- a source the container user cannot reach (e.g. the root-only flash drive) ---------
+
+@pytest.fixture
+def locked_flash(env, monkeypatch):
+    locked = env["tmp"] / "flash" / "config"
+    real_stat = os.stat
+
+    def fake_stat(path, *args, **kwargs):
+        if str(path) == str(locked):
+            raise PermissionError(13, "Permission denied")
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(server.os, "stat", fake_stat)
+    server.BACKUP_ITEMS["boot"] = {
+        "name": "Boot", "optional": True, "sources": [(locked, "boot/config")], "exclude_env": False,
+    }
+    return locked
+
+
+def test_unreadable_source_does_not_break_the_options_endpoint(api, locked_flash):
+    response = api.get("/api/backups/options", auth=AUTH)
+    assert response.status_code == 200
+    items = {i["id"]: i for i in response.json()["items"]}
+    assert items["boot"]["available"] is False and items["boot"]["reason"] == "unreadable"
+    assert items["gone"]["reason"] == "missing"
+    assert items["seerr"]["available"] is True and items["seerr"]["reason"] is None
+
+
+def test_unreadable_source_cannot_be_selected_and_cannot_fail_silently(api, locked_flash):
+    response = api.post("/api/backups/run", json={"items": ["boot"]}, auth=AUTH, headers=HEADERS)
+    assert response.status_code == 400 and "Source not available" in response.text
+    job = run(["boot"])  # bypassing the API check: the job itself must end in a clear failure
+    assert job["status"] == "Failed" and "No files could be archived" in job["error"]
+    assert job["excluded_files"] and job["excluded_files"][0]["kind"] == "directory"
+    assert list(os.listdir(server.CENTRAL_BACKUP_DIR)) == []
+
+
+def test_unreadable_destination_or_folder_never_raises(env, locked_flash, monkeypatch):
+    assert server.dir_state(locked_flash) == "unreadable"
+    assert server.is_dir_safe(locked_flash) is False
+    assert server.dir_state(env["tmp"] / "nope") == "missing"
+    assert server.dir_state(env["seerr"] / "settings.json") == "missing"  # a file is not a directory
+    server.backup_inventory.cache_clear()
+    assert server.backup_inventory()["central_destination_exists"] is True

@@ -12,6 +12,7 @@ import os
 import re
 import secrets
 import shutil
+import stat
 import threading
 import time
 import uuid
@@ -135,6 +136,28 @@ def ttl_cache(seconds: float):
         wrapper.cache_clear = lambda: state.update(at=0.0, value=None)
         return wrapper
     return decorator
+
+
+def dir_state(path: Path) -> str:
+    """Return "ok", "missing" or "unreadable" for a directory. Never raises.
+
+    Path.is_dir() raises PermissionError when the container user cannot search a parent
+    (the root-only flash drive, for example), which would turn one source into a 500 for
+    the whole page.
+    """
+    try:
+        mode = os.stat(path).st_mode
+    except PermissionError:
+        return "unreadable"
+    except OSError:
+        return "missing"
+    if not stat.S_ISDIR(mode):
+        return "missing"
+    return "ok" if os.access(path, os.R_OK | os.X_OK) else "unreadable"
+
+
+def is_dir_safe(path: Path) -> bool:
+    return dir_state(path) == "ok"
 
 
 def public_path(path: Path | str) -> str:
@@ -318,7 +341,7 @@ def backup_inventory() -> dict[str, Any]:
     now = time.time()
     results = []
     for name, folder, stale_days, optional in BACKUP_SOURCES:
-        exists = folder.is_dir()
+        exists = is_dir_safe(folder)
         scan = scan_backup_folder(folder) if exists else None
         newest = scan["newest"] if scan else None
         previous = scan["previous"] if scan else None
@@ -378,7 +401,7 @@ def backup_inventory() -> dict[str, Any]:
     return {
         "sources": results,
         "central_destination": BACKUP_DESTINATION_LABEL,
-        "central_destination_exists": CENTRAL_BACKUP_DIR.is_dir(),
+        "central_destination_exists": is_dir_safe(CENTRAL_BACKUP_DIR),
         "mode": "read-only inventory",
         "integrity_verified": False,
         "note": (
@@ -465,13 +488,15 @@ def now_iso() -> str:
 def backup_options() -> list[dict[str, Any]]:
     options = []
     for item_id, item in BACKUP_ITEMS.items():
-        existing = [str(path) for path, _ in item["sources"] if path.is_dir()]
+        states = [dir_state(path) for path, _ in item["sources"]]
+        existing = states.count("ok")
         options.append({
             "id": item_id,
             "name": item["name"],
             "optional": item["optional"],
-            "available": bool(existing),
-            "source_count": len(existing),
+            "available": existing > 0,
+            "reason": None if existing else ("unreadable" if "unreadable" in states else "missing"),
+            "source_count": existing,
         })
     return options
 
@@ -488,13 +513,14 @@ def backup_file_list(
         excluded.append({"item": item["name"], "path": public_path(path), "reason": reason, "kind": kind})
 
     for root, archive_root in item["sources"]:
-        if root.is_symlink():
+        if os.path.islink(root):
             missing.append(public_path(root) + " (symlink skipped)")
             continue
-        if not root.is_dir():
+        state = dir_state(root)
+        if state == "missing":
             missing.append(public_path(root))
             continue
-        if not os.access(root, os.R_OK | os.X_OK):
+        if state == "unreadable":
             record(root, "Directory is not readable or searchable by the dashboard process", "directory")
             continue
 
@@ -506,7 +532,7 @@ def backup_file_list(
             kept_dirs = []
             for dirname in sorted(dirs):
                 directory = current_path / dirname
-                if directory.is_symlink():
+                if os.path.islink(directory):
                     continue
                 if not os.access(directory, os.R_OK | os.X_OK):
                     record(directory, "Directory is not readable or searchable by the dashboard process", "directory")
@@ -542,7 +568,7 @@ def run_backup_job(job_id: str, selected_ids: list[str]) -> None:
     partial_path: Path | None = None
     excluded_files: list[dict[str, str]] = []
     try:
-        if not CENTRAL_BACKUP_DIR.is_dir():
+        if not is_dir_safe(CENTRAL_BACKUP_DIR):
             raise RuntimeError("Backup destination is not mounted or does not exist.")
         if not os.access(CENTRAL_BACKUP_DIR, os.W_OK):
             raise RuntimeError("Dashboard process cannot write to the backup destination.")
@@ -558,15 +584,18 @@ def run_backup_job(job_id: str, selected_ids: list[str]) -> None:
         for item_id in selected_ids:
             item = BACKUP_ITEMS[item_id]
             files, missing, excluded = backup_file_list(item)
-            if not files and not excluded:
-                raise RuntimeError(f"No files found for {item['name']}. Check that its source path is mounted.")
-            excluded_files.extend(excluded)
+            excluded_files.extend(excluded)  # recorded even if the job then fails
+            if not files:
+                raise RuntimeError(
+                    f"No files could be archived for {item['name']}. "
+                    "Check that its source path is mounted and readable."
+                )
             source_records.append({
                 "id": item_id,
                 "name": item["name"],
                 "files": len(files),
                 "discovered_files": len(files) + sum(1 for entry in excluded if entry["kind"] == "file"),
-                "source_paths": [public_path(root) for root, _ in item["sources"] if root.is_dir()],
+                "source_paths": [public_path(root) for root, _ in item["sources"] if is_dir_safe(root)],
             })
             missing_sources.extend(missing)
             all_files.extend((item_id, path, arcname) for path, arcname in files)
@@ -723,7 +752,7 @@ def backup_job_snapshot() -> dict[str, Any]:
     with backup_state_lock:
         jobs = [dict(value) for value in backup_jobs.values()]
     archives = []
-    if CENTRAL_BACKUP_DIR.is_dir():
+    if is_dir_safe(CENTRAL_BACKUP_DIR):
         try:
             newest_first = sorted(
                 CENTRAL_BACKUP_DIR.glob("Skynet-backup-*.zip"), key=lambda p: p.stat().st_mtime, reverse=True
@@ -1197,7 +1226,7 @@ def storage() -> list[dict[str, Any]]:
         ))
 
     for name, role, host_path, mount in OPTIONAL_VOLUMES:
-        if mount not in seen_mounts and host_path.is_dir():
+        if mount not in seen_mounts and is_dir_safe(host_path):
             out.append(volume_usage(name, role, mount, host_path))
     return out
 
@@ -1408,7 +1437,7 @@ async function loadBackupOptions(){try{
  const d=await api("/api/backups/options"),root=$("backupOptions");root.textContent="";
  for(const item of d.items){const label=document.createElement("label");label.className="opt";
   const input=document.createElement("input");input.type="checkbox";input.value=item.id;input.disabled=!item.available;input.checked=item.available&&!item.optional;
-  label.append(input,document.createTextNode(" "+item.name+(item.optional?" (optional)":"")+(item.available?"":" (source unavailable)")));root.append(label)}
+  label.append(input,document.createTextNode(" "+item.name+(item.optional?" (optional)":"")+(item.available?"":item.reason==="unreadable"?" (not readable by the dashboard)":" (source unavailable)")));root.append(label)}
  }catch(e){$("backupOptions").textContent=e.message}}
 async function startBackup(){
  const selected=[...document.querySelectorAll("#backupOptions input:checked")].map(x=>x.value),status=$("backupRunStatus");
@@ -1556,7 +1585,7 @@ def backups_run(
         raise HTTPException(400, "Unknown backup item selection.")
     unavailable = [
         BACKUP_ITEMS[item]["name"] for item in items
-        if not any(root.is_dir() for root, _arc in BACKUP_ITEMS[item]["sources"])
+        if not any(is_dir_safe(root) for root, _arc in BACKUP_ITEMS[item]["sources"])
     ]
     if unavailable:
         raise HTTPException(400, "Source not available: " + ", ".join(unavailable))
