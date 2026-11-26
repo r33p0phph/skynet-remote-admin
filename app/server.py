@@ -582,6 +582,9 @@ SMART_ATTENTION_KEYS = (
     "program_fail_count", "erase_fail_count",
 )
 
+# 190 airflow temperature, 194 temperature, 231 temperature (SSD): "In_the_past" only means it ran hot once.
+SMART_TEMPERATURE_IDS = {190, 194, 231}
+
 # smartctl -A rows: ID NAME FLAG VALUE WORST THRESH TYPE UPDATED WHEN_FAILED RAW_VALUE
 SMART_ROW = re.compile(
     r"^\s*(\d+)\s+(\S+)\s+0x[0-9a-fA-F]+\s+(\d+)\s+(\d+)\s+(\d+)\s+"
@@ -631,6 +634,7 @@ def parse_smart_report(section_name: str, spun_down: bool = False) -> dict[str, 
     attributes: dict[str, int] = {}
     failing_now: list[str] = []
     failed_before: list[str] = []
+    notes: list[str] = []
     for line in text.splitlines():
         row = SMART_ROW.match(line)
         if row:
@@ -639,7 +643,10 @@ def parse_smart_report(section_name: str, spun_down: bool = False) -> dict[str, 
             if when_failed.startswith("failing"):
                 failing_now.append(row.group(2))
             elif when_failed not in ("-", ""):
-                failed_before.append(row.group(2))
+                if attribute_id in SMART_TEMPERATURE_IDS:
+                    notes.append(f"{row.group(2)} reached its threshold in the past (the drive ran hot at some point)")
+                else:
+                    failed_before.append(row.group(2))
             if attribute_id in SMART_ATTRIBUTES:
                 value = leading_int(row.group(9))
                 if value is not None:
@@ -689,6 +696,7 @@ def parse_smart_report(section_name: str, spun_down: bool = False) -> dict[str, 
         "attention_attributes": attention,
         "critical_attributes": critical,
         "attributes": attributes,
+        "notes": notes,
         "overall_smart_passed": None,
         "note": "Cached SMART attributes only. The report does not contain an overall SMART PASSED/FAILED result.",
     }
@@ -725,7 +733,7 @@ def disk_inventory() -> dict[str, Any]:
             "smart": smart,
         })
 
-    role_order = {"Parity": 0, "Data": 1, "Cache": 2, "Flash": 3}
+    role_order = {"Parity": 0, "Data": 1, "Cache": 2, "Boot": 3, "Flash": 3}
     inventory.sort(key=lambda item: (
         role_order.get(item["role"], 9),
         item["index"] if item["index"] is not None else 999,
@@ -768,6 +776,8 @@ def storage() -> list[dict[str, Any]]:
         mountpoint = fields.get("fsMountpoint", "").strip()
         if not mountpoint or not re.fullmatch(r"/mnt/(?:disk\d+|[A-Za-z0-9_.-]+)", mountpoint):
             continue
+        if fields.get("fsStatus", "Mounted") not in ("Mounted", ""):
+            continue  # e.g. an unassigned slot (fsStatus "-")
         if mountpoint in seen_mounts:
             continue
         seen_mounts.add(mountpoint)
@@ -817,10 +827,11 @@ def health_summary(array: dict[str, Any], inventory: dict[str, Any]) -> dict[str
     unassigned_parity: list[str] = []
     parity_assigned = 0
     configured_data = 0
+    unassigned_disabled = 0
 
     for disk in devices:
         role = disk["role"]
-        if role not in ("Parity", "Data", "Cache"):
+        if role not in ("Parity", "Data", "Cache", "Boot"):
             continue
         has_device = bool(disk["device"])
         kind = classify_disk_status(disk["status"], has_device, disk.get("size_bytes"))
@@ -832,6 +843,8 @@ def health_summary(array: dict[str, Any], inventory: dict[str, Any]) -> dict[str
         if role == "Data" and has_device:
             configured_data += 1
         if kind == "unassigned":
+            if "DSBL" in (disk["status"] or "").upper():
+                unassigned_disabled += 1
             continue
 
         problem = False
@@ -852,11 +865,17 @@ def health_summary(array: dict[str, Any], inventory: dict[str, Any]) -> dict[str
             data_needing_attention.append(disk["name"])
 
     # Cross-check against the array's own counters in case the slot parse missed something.
-    flagged = {k: counter(k) for k in ("mdNumDisabled", "mdNumInvalid", "mdNumMissing")}
-    if not degraded and any(flagged.values()):
+    # An empty parity2 slot is reported as DISK_NP_DSBL, and Unraid counts it as one disabled and
+    # one invalid device even on a healthy array. Only counts beyond those empty slots are a problem.
+    flagged = {
+        "mdNumDisabled": counter("mdNumDisabled") - unassigned_disabled,
+        "mdNumInvalid": counter("mdNumInvalid") - unassigned_disabled,
+        "mdNumMissing": counter("mdNumMissing"),
+    }
+    if not degraded and any(v > 0 for v in flagged.values()):
         degraded = True
-        issues.append("Array reports " + ", ".join(
-            f"{k[5:].lower()}: {v}" for k, v in flagged.items() if v
+        issues.append("Array reports unexplained " + ", ".join(
+            f"{k[5:].lower()}: {v}" for k, v in flagged.items() if v > 0
         ))
     if configured_data and parity_assigned == 0:
         attention = True

@@ -1,0 +1,13 @@
+/mnt/addons             1024
+/mnt/cache        1953513560
+/mnt/datastorage  1866180932
+/mnt/disk1        9764349900
+/mnt/disk2        9764349900
+/mnt/disk3        9764349900
+/mnt/disk4        9764349900
+/mnt/disks              1024
+/mnt/remotes            1024
+/mnt/rootshare          1024
+/mnt/user        39057399600
+/mnt/user0       39057399600
+Mounted on         1K-blocks

@@ -49,7 +49,7 @@ def test_disks_ini_units_match_df():
     if not df.is_file():
         pytest.skip("no df.txt")
     real = {}
-    for line in df.read_text().splitlines()[1:]:
+    for line in df.read_text().splitlines():
         parts = line.split()
         if len(parts) == 2 and parts[1].isdigit():
             real[parts[0]] = int(parts[1]) * 1024

@@ -10,7 +10,8 @@ The app name above is separate from the build label, which lives in `VERSION`.
 | Path | What it is |
 |---|---|
 | `app/server.py` | The FastAPI app (single file) |
-| `tests/` | Unit tests plus optional tests against real Unraid files |
+| `tests/` | Unit tests, plus tests against real Unraid files |
+| `tests/data/real-unraid/` | Sanitized sample from a real Unraid 7.x server (masked drive IDs); always tested, including in CI |
 | `scripts/collect_fixtures.sh` | Run on the Unraid host to copy (masked) real files for testing |
 | `VERSION` | Internal build label |
 

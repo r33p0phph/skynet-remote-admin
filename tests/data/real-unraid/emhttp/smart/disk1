@@ -1,0 +1,31 @@
+smartctl 7.5 2025-04-30 r5714 [x86_64-linux-6.18.64-Unraid] (local build)
+Copyright (C) 2002-25, Bruce Allen, Christian Franke, www.smartmontools.org
+
+=== START OF READ SMART DATA SECTION ===
+SMART Attributes Data Structure revision number: 10
+Vendor Specific SMART Attributes with Thresholds:
+ID# ATTRIBUTE_NAME          FLAG     VALUE WORST THRESH TYPE      UPDATED  WHEN_FAILED RAW_VALUE
+  1 Raw_Read_Error_Rate     0x000f   082   064   044    Pre-fail  Always       -       167872408
+  3 Spin_Up_Time            0x0003   093   092   000    Pre-fail  Always       -       0
+  4 Start_Stop_Count        0x0032   100   100   020    Old_age   Always       -       546
+  5 Reallocated_Sector_Ct   0x0033   100   100   010    Pre-fail  Always       -       56
+  7 Seek_Error_Rate         0x000f   096   060   045    Pre-fail  Always       -       3817988160
+  9 Power_On_Hours          0x0032   040   040   000    Old_age   Always       -       52829 (45 89 0)
+ 10 Spin_Retry_Count        0x0013   100   100   097    Pre-fail  Always       -       0
+ 12 Power_Cycle_Count       0x0032   100   100   020    Old_age   Always       -       545
+184 End-to-End_Error        0x0032   100   100   099    Old_age   Always       -       0
+187 Reported_Uncorrect      0x0032   100   100   000    Old_age   Always       -       0
+188 Command_Timeout         0x0032   100   100   000    Old_age   Always       -       0 0 0
+189 High_Fly_Writes         0x003a   042   042   000    Old_age   Always       -       58
+190 Airflow_Temperature_Cel 0x0022   059   040   040    Old_age   Always   In_the_past 41 (Min/Max 40/48)
+191 G-Sense_Error_Rate      0x0032   092   092   000    Old_age   Always       -       17534
+192 Power-Off_Retract_Count 0x0032   100   100   000    Old_age   Always       -       717
+193 Load_Cycle_Count        0x0032   099   099   000    Old_age   Always       -       2737
+194 Temperature_Celsius     0x0022   041   060   000    Old_age   Always       -       41 (0 23 0 0 0)
+195 Hardware_ECC_Recovered  0x001a   007   001   000    Old_age   Always       -       167872408
+197 Current_Pending_Sector  0x0012   100   095   000    Old_age   Always       -       0
+198 Offline_Uncorrectable   0x0010   100   095   000    Old_age   Offline      -       0
+199 UDMA_CRC_Error_Count    0x003e   200   200   000    Old_age   Always       -       0
+240 Head_Flying_Hours       0x0000   100   253   000    Old_age   Offline      -       52433h+19m+10.832s
+241 Total_LBAs_Written      0x0000   100   253   000    Old_age   Offline      -       321527501018
+242 Total_LBAs_Read         0x0000   100   253   000    Old_age   Offline      -       430278569194

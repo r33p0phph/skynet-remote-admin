@@ -499,3 +499,58 @@ def test_ttl_cache_expires(monkeypatch):
     assert compute() == 1 and compute() == 1
     clock["t"] += 61
     assert compute() == 2
+
+
+# ---- found with real Unraid data -------------------------------------------
+
+def test_counters_explained_by_empty_parity2_slot_do_not_degrade():
+    # Unraid counts an empty parity2 slot (DISK_NP_DSBL) as one disabled and one invalid device.
+    result = summary(
+        [
+            disk("parity", "Parity"),
+            disk("parity2", "Parity", device=None, status="DISK_NP_DSBL", size=0),
+            disk("disk1", "Data"),
+        ],
+        mdNumDisabled="1", mdNumInvalid="1",
+    )
+    assert result["state"] == "Healthy" and result["issues"] == []
+
+
+def test_counters_beyond_empty_slots_still_degrade():
+    result = summary(
+        [
+            disk("parity", "Parity"),
+            disk("parity2", "Parity", device=None, status="DISK_NP_DSBL", size=0),
+            disk("disk1", "Data"),
+        ],
+        mdNumDisabled="2", mdNumInvalid="1",
+    )
+    assert result["state"] == "Degraded"
+    assert "unexplained" in result["issues"][0]
+
+
+def test_smart_temperature_in_the_past_is_a_note_not_a_warning(smart_dir):
+    line = "190 Airflow_Temperature_Cel 0x0022   059   040   040    Old_age   Always   In_the_past 41 (Min/Max 40/48)\n"
+    (smart_dir / "disk1").write_text(SATA_REPORT + line)
+    report = server.parse_smart_report("disk1")
+    assert report["assessment"] == "No flagged attributes"
+    assert report["attention_attributes"] == []
+    assert any("Airflow_Temperature_Cel" in note for note in report["notes"])
+
+
+def test_other_attributes_failed_in_the_past_still_need_review(smart_dir):
+    line = "  5 Reallocated_Sector_Ct   0x0033   100   100   010    Pre-fail  Always   In_the_past 0\n"
+    (smart_dir / "disk1").write_text(SATA_REPORT + line)
+    report = server.parse_smart_report("disk1")
+    assert "failed_in_past:Reallocated_Sector_Ct" in report["attention_attributes"]
+
+
+def test_storage_skips_slots_that_are_not_mounted(tmp_path, monkeypatch):
+    (tmp_path / "disks.ini").write_text(
+        '["disk1"]\nname="disk1"\ntype="Data"\nfsStatus="Mounted"\nfsMountpoint="/mnt/disk1"\n'
+        '["disk5"]\nname="disk5"\ntype="Data"\nfsStatus="-"\nfsMountpoint="/mnt/disk5"\n'
+    )
+    (tmp_path / "mnt" / "disk1").mkdir(parents=True)
+    monkeypatch.setattr(server, "EMHTTP", tmp_path)
+    monkeypatch.setattr(server, "HOST_MNT", tmp_path / "mnt")
+    assert [v["name"] for v in server.storage()] == ["disk1"]
