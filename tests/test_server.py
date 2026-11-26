@@ -554,3 +554,19 @@ def test_storage_skips_slots_that_are_not_mounted(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "EMHTTP", tmp_path)
     monkeypatch.setattr(server, "HOST_MNT", tmp_path / "mnt")
     assert [v["name"] for v in server.storage()] == ["disk1"]
+
+
+def test_backup_folder_the_dashboard_cannot_read_is_not_reported_as_missing(tmp_path, monkeypatch):
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    (locked / "a.zip").write_bytes(b"x")
+    real_access = os.access
+    monkeypatch.setattr(server.os, "access", lambda p, mode, **kw: False if str(p) == str(locked) else real_access(p, mode, **kw))
+    monkeypatch.setattr(server, "BACKUP_SOURCES", [("Locked", locked, 30, False), ("Gone", tmp_path / "gone", 30, False)])
+    monkeypatch.setattr(server, "CENTRAL_BACKUP_DIR", tmp_path / "central")
+    server.backup_inventory.cache_clear()
+    by_name = {s["application"]: s for s in server.backup_inventory()["sources"]}
+    assert by_name["Locked"]["status"] == "Not readable" and by_name["Locked"]["folder_exists"] is True
+    assert by_name["Locked"]["file_count"] == 0 and by_name["Locked"]["warnings"]
+    assert by_name["Gone"]["status"] == "Missing folder" and by_name["Gone"]["folder_exists"] is False
+    server.backup_inventory.cache_clear()

@@ -341,7 +341,8 @@ def backup_inventory() -> dict[str, Any]:
     now = time.time()
     results = []
     for name, folder, stale_days, optional in BACKUP_SOURCES:
-        exists = is_dir_safe(folder)
+        state = dir_state(folder)
+        exists = state == "ok"
         scan = scan_backup_folder(folder) if exists else None
         newest = scan["newest"] if scan else None
         previous = scan["previous"] if scan else None
@@ -365,7 +366,10 @@ def backup_inventory() -> dict[str, Any]:
         if scan and scan["truncated"]:
             warnings.append(f"Scan stopped after {MAX_SCAN_FILES} files")
 
-        if not exists:
+        if state == "unreadable":
+            status = "Not readable"
+            warnings.append("The folder exists but the dashboard user cannot read it")
+        elif not exists:
             status = "Not present (optional)" if optional else "Missing folder"
         elif newest is None:
             status = "No backup files"
@@ -379,7 +383,7 @@ def backup_inventory() -> dict[str, Any]:
         results.append({
             "application": name,
             "folder": public_path(folder),
-            "folder_exists": exists,
+            "folder_exists": state != "missing",
             "optional": optional,
             "file_count": scan["file_count"] if scan else 0,
             "total_bytes": scan["total_bytes"] if scan else 0,
@@ -1400,7 +1404,7 @@ function fmt(b){if(b==null)return"Unavailable";let u=["B","KiB","MiB","GiB","TiB
 const TONES=[
  [/^(Healthy|Recent|DISK_OK|OK|No flagged attributes|running|healthy|Completed|Complete|Passed)$/,"good"],
  [/^(Degraded|Stale|Missing folder|No backup files|Attention required|FAILED|Failed|Incomplete|DISK_DSBL|DISK_INVALID|DISK_NP_DSBL|unhealthy|dead)/,"bad"],
- [/^(Check|Review attributes|Attention|Running|Queued|Not present \(optional\)|DISK_NEW|exited|restarting|paused|created|Stopped|Unknown|No parsed attributes)/,"warn"]
+ [/^(Check|Not readable|Review attributes|Attention|Running|Queued|Not present \(optional\)|DISK_NEW|exited|restarting|paused|created|Stopped|Unknown|No parsed attributes)/,"warn"]
 ];
 function tone(t){for(const [re,c] of TONES)if(re.test(t))return c;return""}
 function table(target,headers,rows){const root=$(target);root.textContent="";if(!rows.length){root.textContent="No data available.";return}
